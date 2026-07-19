@@ -1,23 +1,21 @@
 """
-Meoo2API - OpenAI 兼容 API 代理
+Meoo2API - OpenAI compatible API proxy.
 
-将 Meoo(秒悟) 内部 API 转换为 OpenAI 兼容格式，
-支持 /v1/chat/completions 和 /v1/images/generations
-
-用法:
-    pip install -r requirements.txt
-    cp .env.example .env   # 编辑填入 MEOO_COOKIE
-    python main.py
+Converts Meoo internal APIs into OpenAI-compatible chat endpoints.
 """
+
+from __future__ import annotations
 
 import json
 import logging
+import time
+import uuid
 from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field
 
 from config import config
 from converter import (
@@ -27,9 +25,9 @@ from converter import (
     meoo_message_to_openai_chunk,
     openai_messages_to_text,
 )
-from meoo_client import client
+from meoo_client import MeooAPIError, MeooTimeoutError, client
 
-# ── 日志 ──────────────────────────────────────────
+# -- Logging ---------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -37,49 +35,68 @@ logging.basicConfig(
 logger = logging.getLogger("meoo2api")
 
 
-# ── 生命周期 ──────────────────────────────────────
+def _public_detail(exc: Exception, generic: str) -> str:
+    """Expose controlled Meoo errors; hide unexpected internals."""
+    if isinstance(exc, MeooAPIError):
+        return str(exc)
+    return generic
+
+
+# -- Lifecycle -------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     config.validate()
-    logger.info(f"Meoo2API 启动, 监听: {config.HOST}:{config.PORT}")
-    logger.info(f"代理目标: {config.MEOO_BASE_URL}")
-    logger.info(f"API 鉴权: {'已启用' if config.API_KEY else '未启用（开放访问）'}")
-    logger.info(f"跳过内容安全检测: {config.MEOO_SKIP_SECURITY}")
+    logger.info("Meoo2API starting, listen: %s:%s", config.HOST, config.PORT)
+    logger.info("Upstream: %s", config.MEOO_BASE_URL)
+    logger.info("API auth: %s", "enabled" if config.API_KEY else "disabled (open)")
+    logger.info("Skip content security: %s", config.MEOO_SKIP_SECURITY)
     yield
     await client.close()
-    logger.info("Meoo2API 关闭")
-
-
-# ── 鉴权中间件 ────────────────────────────────────
+    logger.info("Meoo2API stopped")
 
 
 app = FastAPI(
     title="Meoo2API",
-    description="OpenAI-compatible API proxy for Meoo(秒悟)",
-    version="1.0.0",
+    description="OpenAI-compatible API proxy for Meoo",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
-    """API Key 鉴权中间件"""
-    # 健康检查不鉴权
+    """API key middleware. Returns JSONResponse (not raise) for reliable 401/403."""
     if request.url.path == "/health":
         return await call_next(request)
 
     if config.API_KEY:
         auth = request.headers.get("Authorization", "")
         if not auth.startswith("Bearer "):
-            raise HTTPException(status_code=401, detail="缺少 Authorization: Bearer <api_key>")
-        token = auth[7:]  # 去掉 "Bearer " 前缀
+            return JSONResponse(
+                status_code=401,
+                content={
+                    "error": {
+                        "message": "Missing Authorization: Bearer <api_key>",
+                        "type": "auth_error",
+                    }
+                },
+            )
+        token = auth[7:]
         if token != config.API_KEY:
-            raise HTTPException(status_code=403, detail="API Key 无效")
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "error": {
+                        "message": "Invalid API key",
+                        "type": "auth_error",
+                    }
+                },
+            )
 
     return await call_next(request)
 
 
-# ── OpenAI 请求模型 ──────────────────────────────
+# -- OpenAI request models -------------------------
 
 class Message(BaseModel):
     role: str
@@ -87,59 +104,69 @@ class Message(BaseModel):
 
 
 class ChatCompletionRequest(BaseModel):
-    model: str = DEFAULT_TEXT_MODEL  # qwen3.7-max
-    messages: list[Message]
+    model: str = DEFAULT_TEXT_MODEL
+    messages: list[Message] = Field(min_length=1)
     stream: bool = False
+    # Accepted for OpenAI SDK compatibility; Meoo has no direct mapping yet.
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
 
 
-# ── 路由 ──────────────────────────────────────────
+# -- Routes ----------------------------------------
 
 @app.get("/v1/models")
 async def list_models():
-    """列出可用模型"""
+    """List available models."""
     return get_model_list()
 
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest):
     """
-    OpenAI 兼容的聊天补全端点
-    
-    将请求转换为 Meoo agent/start 调用，轮询获取结果后返回
+    OpenAI-compatible chat completions.
+
+    Serializes full message history into a Meoo agent/start call, then polls
+    for the assistant reply (SSE when stream=true).
     """
-    # 1. 提取用户消息
-    user_text = openai_messages_to_text(
-        [m.model_dump() for m in req.messages]
-    )
-    if not user_text:
-        raise HTTPException(status_code=400, detail="未找到用户消息")
+    prompt = openai_messages_to_text([m.model_dump() for m in req.messages])
+    if not prompt.strip():
+        raise HTTPException(status_code=400, detail="No non-empty messages found")
 
-    logger.info(f"收到对话请求: {user_text[:100]}...")
+    logger.info("Chat request model=%s chars=%s", req.model, len(prompt))
 
-    # 2. 获取或创建项目
     try:
         project_id = await client.get_or_create_project()
-    except Exception as e:
-        logger.error(f"获取项目失败: {e}")
-        raise HTTPException(status_code=500, detail=f"项目初始化失败: {e}")
+    except MeooAPIError as exc:
+        logger.error("Project init failed: %s", exc)
+        raise HTTPException(status_code=exc.status_code or 502, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BROAD_EXCEPT_OK - route boundary
+        logger.exception("Project init unexpected error")
+        raise HTTPException(
+            status_code=500,
+            detail=_public_detail(exc, "Project initialization failed"),
+        ) from exc
 
-    # 3. 发送消息
     try:
         send_result = await client.send_message(
-            message=user_text,
+            message=prompt,
             project_id=project_id,
-            task_id="",  # 每次新会话
+            task_id="",
             model=req.model,
         )
-        task_id = send_result.get("taskId", "")
-        logger.info(f"消息已发送, taskId={task_id}")
-    except Exception as e:
-        logger.error(f"发送消息失败: {e}")
-        raise HTTPException(status_code=500, detail=f"发送失败: {e}")
+        task_id = str(send_result.get("taskId") or "")
+        if not task_id:
+            raise MeooAPIError("Meoo did not return taskId")
+        logger.info("Message sent taskId=%s projectId=%s", task_id, project_id)
+    except MeooAPIError as exc:
+        logger.error("Send failed: %s", exc)
+        raise HTTPException(status_code=exc.status_code or 502, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BROAD_EXCEPT_OK - route boundary
+        logger.exception("Send unexpected error")
+        raise HTTPException(
+            status_code=500,
+            detail=_public_detail(exc, "Failed to send message"),
+        ) from exc
 
-    # 4. 流式模式
     if req.stream:
         return StreamingResponse(
             _stream_chat(task_id, req.model),
@@ -151,63 +178,94 @@ async def chat_completions(req: ChatCompletionRequest):
             },
         )
 
-    # 5. 非流式模式 - 轮询等待
     try:
         assistant_msg = await client.poll_assistant_message(task_id)
-    except Exception as e:
-        logger.error(f"轮询消息失败: {e}")
-        raise HTTPException(status_code=500, detail=f"获取回复失败: {e}")
-
-    if assistant_msg is None:
+    except MeooTimeoutError as exc:
+        logger.error("Poll timeout: %s", exc)
+        raise HTTPException(status_code=504, detail=str(exc)) from exc
+    except MeooAPIError as exc:
+        logger.error("Poll failed: %s", exc)
+        raise HTTPException(status_code=exc.status_code or 502, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BROAD_EXCEPT_OK - route boundary
+        logger.exception("Poll unexpected error")
         raise HTTPException(
-            status_code=504,
-            detail=f"等待回复超时 ({config.MEOO_POLL_TIMEOUT}s)",
-        )
+            status_code=500,
+            detail=_public_detail(exc, "Failed to fetch reply"),
+        ) from exc
 
-    # 6. 转换为 OpenAI 格式
     result = meoo_message_to_openai_chat(assistant_msg, model=req.model)
-    logger.info(f"对话完成, tokens={result.get('usage', {}).get('total_tokens', '?')}")
+    logger.info(
+        "Chat done tokens=%s",
+        result.get("usage", {}).get("total_tokens", "?"),
+    )
     return result
 
 
-# ── 流式生成器 ────────────────────────────────────
-
 async def _stream_chat(task_id: str, model: str):
-    """SSE 流式输出聊天内容"""
+    """SSE stream chat content with a stable chunk id for the whole response."""
+    chunk_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+    created = int(time.time())
+    finished_cleanly = False
+
     try:
         async for delta_text in client.poll_stream(task_id):
             chunk = meoo_message_to_openai_chunk(
-                delta_text, model=model, finish_reason=None
+                delta_text,
+                model=model,
+                finish_reason=None,
+                chunk_id=chunk_id,
+                created=created,
             )
             yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
-        # 发送结束标记
         final_chunk = meoo_message_to_openai_chunk(
-            "", model=model, finish_reason="stop"
+            "",
+            model=model,
+            finish_reason="stop",
+            chunk_id=chunk_id,
+            created=created,
         )
         yield f"data: {json.dumps(final_chunk, ensure_ascii=False)}\n\n"
         yield "data: [DONE]\n\n"
+        finished_cleanly = True
 
-    except Exception as e:
-        logger.error(f"流式输出异常: {e}")
+    except MeooTimeoutError as exc:
+        logger.error("Stream timeout: %s", exc)
         error_chunk = {
-            "error": {"message": str(e), "type": "stream_error"}
+            "error": {"message": str(exc), "type": "timeout_error"},
         }
-        yield f"data: {json.dumps(error_chunk)}\n\n"
+        yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n"
         yield "data: [DONE]\n\n"
+    except MeooAPIError as exc:
+        logger.error("Stream Meoo error: %s", exc)
+        error_chunk = {
+            "error": {"message": str(exc), "type": "upstream_error"},
+        }
+        yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n"
+        yield "data: [DONE]\n\n"
+    except Exception as exc:  # noqa: BROAD_EXCEPT_OK - stream boundary
+        logger.exception("Stream unexpected error")
+        error_chunk = {
+            "error": {
+                "message": _public_detail(exc, "Stream failed"),
+                "type": "stream_error",
+            }
+        }
+        yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n"
+        yield "data: [DONE]\n\n"
+    finally:
+        if not finished_cleanly:
+            logger.debug("Stream closed without clean finish taskId=%s", task_id)
 
-
-# ── 健康检查 ──────────────────────────────────────
 
 @app.get("/health")
 async def health():
     return {"status": "ok", "meoo_base_url": config.MEOO_BASE_URL}
 
 
-# ── 启动入口 ──────────────────────────────────────
-
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(
         "main:app",
         host=config.HOST,

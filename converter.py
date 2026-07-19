@@ -1,40 +1,85 @@
-"""格式转换模块 - OpenAI API 格式 ↔ Meoo 内部格式"""
+"""Format conversion: OpenAI API shapes <-> Meoo internal shapes."""
+
+from __future__ import annotations
 
 import time
 import uuid
-from typing import Any
+from typing import Any, Final
+
+# Default model ids used when callers omit model.
+DEFAULT_TEXT_MODEL: Final[str] = "qwen3.7-max"
+_DEFAULT_CHUNK_MODEL: Final[str] = "meoo-bolt-claude"
 
 
-# ── OpenAI → Meoo ────────────────────────────────
+def _content_to_text(content: Any) -> str:
+    """Normalize OpenAI message content (string or multimodal parts) to text."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        texts: list[str] = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                text = part.get("text", "")
+                if isinstance(text, str) and text:
+                    texts.append(text)
+            elif isinstance(part, str) and part:
+                texts.append(part)
+        return "\n".join(texts)
+    return str(content)
+
 
 def openai_messages_to_text(messages: list[dict]) -> str:
-    """提取最后一条用户消息的文本内容"""
-    for msg in reversed(messages):
-        if msg.get("role") == "user":
-            content = msg.get("content", "")
-            # 支持多模态 content 数组
-            if isinstance(content, list):
-                for part in content:
-                    if isinstance(part, dict) and part.get("type") == "text":
-                        return part.get("text", "")
-            return content if isinstance(content, str) else str(content)
-    # fallback: 合并所有 user 消息
-    return "\n".join(
-        m.get("content", "") for m in messages
-        if m.get("role") == "user" and isinstance(m.get("content"), str)
-    )
+    """
+    Serialize a full OpenAI messages array into one Meoo prompt.
 
+    Includes system / user / assistant / tool turns so multi-turn clients
+    do not silently drop history.
+    """
+    parts: list[str] = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = str(msg.get("role") or "user")
+        text = _content_to_text(msg.get("content"))
+        if not text.strip():
+            continue
 
-# ── Meoo → OpenAI ────────────────────────────────
+        match role:
+            case "system":
+                label = "System"
+            case "assistant":
+                label = "Assistant"
+            case "user":
+                label = "User"
+            case "tool":
+                label = "Tool"
+            case "function":
+                label = "Function"
+            case _:
+                label = role
+
+        parts.append(f"[{label}]\n{text}")
+
+    return "\n\n".join(parts)
+
 
 def meoo_message_to_openai_chat(
     assistant_msg: dict,
-    model: str = "meoo-bolt-claude",
+    model: str = _DEFAULT_CHUNK_MODEL,
 ) -> dict:
-    """将 Meoo assistant 消息转为 OpenAI chat completion 响应"""
+    """Convert a Meoo assistant message into an OpenAI chat.completion object."""
     content = assistant_msg.get("content", "")
-    metadata = assistant_msg.get("metadata", {})
-    usage = metadata.get("usageInfo", {})
+    if not isinstance(content, str):
+        content = str(content) if content is not None else ""
+
+    metadata = assistant_msg.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    usage = metadata.get("usageInfo")
+    if not isinstance(usage, dict):
+        usage = {}
 
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
@@ -52,46 +97,61 @@ def meoo_message_to_openai_chat(
             }
         ],
         "usage": {
-            "prompt_tokens": usage.get("inputTokens", 0),
-            "completion_tokens": usage.get("outputTokens", 0),
-            "total_tokens": usage.get("totalTokens", 0),
+            "prompt_tokens": int(usage.get("inputTokens") or 0),
+            "completion_tokens": int(usage.get("outputTokens") or 0),
+            "total_tokens": int(usage.get("totalTokens") or 0),
         },
     }
 
 
 def meoo_message_to_openai_chunk(
     delta_text: str,
-    model: str = "meoo-bolt-claude",
+    model: str = _DEFAULT_CHUNK_MODEL,
     index: int = 0,
     finish_reason: str | None = None,
+    *,
+    chunk_id: str | None = None,
+    created: int | None = None,
 ) -> dict:
-    """将流式文本片段转为 OpenAI SSE chunk"""
-    chunk = {
-        "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
+    """
+    Convert a streaming text delta into an OpenAI chat.completion.chunk.
+
+    `chunk_id` / `created` should stay stable for the whole stream.
+    """
+    if chunk_id is None:
+        chunk_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+    if created is None:
+        created = int(time.time())
+
+    delta: dict[str, str]
+    if finish_reason is None:
+        delta = {"content": delta_text}
+    else:
+        delta = {}
+
+    return {
+        "id": chunk_id,
         "object": "chat.completion.chunk",
-        "created": int(time.time()),
+        "created": created,
         "model": model,
         "choices": [
             {
                 "index": index,
-                "delta": {"content": delta_text} if not finish_reason else {},
+                "delta": delta,
                 "finish_reason": finish_reason,
             }
         ],
     }
-    return chunk
 
 
-# ── 模型列表（从 Meoo 抓包提取）───────────────────
+# -- Model list (from Meoo capture) ----------------
 #
-# 文本模型: POST /api/agent/start 的 model/llmMode 字段
-#   chatType 固定为 "BOLT_CLAUDE"，mode 固定为 "swarms"
-# 图片模型: 通过 agent/start 发送图片生成 prompt 时触发
+# Text models: POST /api/agent/start model / llmMode fields
+#   chatType fixed to "BOLT_CLAUDE", mode fixed to "swarms"
 #
-# 来源: 2026-07-05 Reqable 抓包分析
+# Source: 2026-07-05 Reqable capture analysis
 
-OPENAI_MODELS = [
-    # ── 文本模型 ──
+OPENAI_MODELS: Final[list[dict[str, object]]] = [
     {
         "id": "auto",
         "object": "model",
@@ -158,12 +218,9 @@ OPENAI_MODELS = [
 ]
 
 
-# 默认模型
-DEFAULT_TEXT_MODEL = "qwen3.7-max"
-
-
 def get_model_list() -> dict:
+    """Return OpenAI-compatible /v1/models payload."""
     return {
         "object": "list",
-        "data": OPENAI_MODELS,
+        "data": list(OPENAI_MODELS),
     }

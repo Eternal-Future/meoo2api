@@ -249,12 +249,13 @@ async def _direct_chat(args):
     else:
         print("\n⏳ 等待回复...")
         start = time.time()
-        assistant_msg = await c.poll_assistant_message(task_id)
-        elapsed = time.time() - start
-
-        if assistant_msg is None:
-            print("❌ 超时未收到回复")
+        try:
+            assistant_msg = await c.poll_assistant_message(task_id)
+        except Exception as e:
+            elapsed = time.time() - start
+            print(f"❌ 获取回复失败 (耗时 {elapsed:.1f}s): {e}")
             return
+        elapsed = time.time() - start
 
         content = assistant_msg.get("content", "")
         metadata = assistant_msg.get("metadata", {})

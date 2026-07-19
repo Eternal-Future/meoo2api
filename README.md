@@ -139,13 +139,21 @@ print(response.choices[0].message.content)
 ```
 
 **对话流程：**
-1. 提取最后一条 user message → 构建 `POST /api/agent/start` 请求
-2. 发送到 Meoo，获得 `taskId`
-3. 轮询 `GET /api/v1/agent/chat/messages` 等待 assistant 回复
-4. 转为 OpenAI `choices[].message` 格式返回
+1. 将完整 `messages`（system / user / assistant / tool）序列化为单条 prompt → 构建 `POST /api/agent/start` 请求
+2. 复用进程内缓存的 `projectId`（或 `MEOO_PROJECT_ID`），避免每次新建项目
+3. 发送到 Meoo，获得 `taskId`
+4. 轮询 `GET /api/v1/agent/chat/messages` 等待最终 assistant 回复（跳过 tool_calls 中间态）
+5. 转为 OpenAI `choices[].message` 格式返回
 
 **Stream 模式：**
-- 轮询期间通过 SSE delta 推送新增内容，模拟流式输出
+- 轮询期间通过 SSE delta 推送新增内容；同一次响应的 `id` 保持稳定
+- 超时返回 `timeout_error`，不再伪装成正常 `finish_reason=stop`
+
+## 已知限制
+
+- `temperature` / `max_tokens` 会被接受（兼容 OpenAI SDK），但暂未映射到 Meoo 上游参数
+- 多轮历史通过拼进 prompt 传递，不是 Meoo 原生会话续聊（每次请求仍是新 `taskId`）
+- 未实现 `/v1/images/generations`
 
 ## 许可
 
